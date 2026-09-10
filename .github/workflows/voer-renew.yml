@@ -130,6 +130,14 @@ jobs:
           xvfb-run -a python3 voer_renew.py
           echo "脚本执行完毕，请查看上方日志是否显示「续期成功」"
 
+      - name: 上传失败截图（如有）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug_screenshot.png
+          if-no-files-found: ignore
+
       - name: 续期后再次确认状态
         if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'renew'))
         env:
