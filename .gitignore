@@ -1,0 +1,7 @@
+config.json
+*.log
+renew.log
+debug_screenshot*.png
+renew_screenshot*.png
+__pycache__/
+*.pyc
