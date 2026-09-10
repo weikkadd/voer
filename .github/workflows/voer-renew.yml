@@ -3,7 +3,9 @@
 #
 # 使用前必须在仓库 Settings → Secrets and variables → Actions 里添加：
 #   VOER_SERVER_ID   = 服务器 UUID
-#   VOER_TOKEN       = Cookie 中的 token（JWT）
+#   VOER_TOKEN          = Cookie 中的 token（JWT）
+#   TELEGRAM_BOT_TOKEN  = （可选）Telegram Bot Token，用于续期结果通知+截图
+#   TELEGRAM_CHAT_ID    = （可选）Telegram Chat ID
 #
 # 如何获取这两个值（非常重要）：
 # 1. 浏览器登录 https://voer.host
@@ -84,6 +86,8 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ -z "$VOER_SERVER_ID" ] || [ -z "$VOER_TOKEN" ]; then
             echo "❌ 缺少 Secrets！"
@@ -95,7 +99,7 @@ jobs:
             exit 1
           fi
           # 只打印长度和开头，不泄露完整 secret
-          echo "✅ Secrets 已配置"
+          echo "✅ 必要 Secrets 已配置"
           echo "  VOER_SERVER_ID 长度=${#VOER_SERVER_ID}, 开头=${VOER_SERVER_ID:0:8}..."
           echo "  VOER_TOKEN     长度=${#VOER_TOKEN}, 开头=${VOER_TOKEN:0:8}..."
           DOTS=$(echo -n "$VOER_TOKEN" | tr -cd '.' | wc -c)
@@ -106,12 +110,26 @@ jobs:
           if [ "$DOTS" -ne 2 ]; then
             echo "⚠️  警告：标准 JWT 应有 2 个点（3 段），当前点数=$DOTS，可能复制不完整"
           fi
+          # Telegram（可选）
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ℹ️  Telegram 未完整配置（将跳过 TG 通知）"
+            echo "   需要同时存在这两个 Repository secrets（名称必须完全一致）："
+            echo "     TELEGRAM_BOT_TOKEN  长度=${#TELEGRAM_BOT_TOKEN}"
+            echo "     TELEGRAM_CHAT_ID    长度=${#TELEGRAM_CHAT_ID}"
+            echo "   Settings → Secrets and variables → Actions → New repository secret"
+          else
+            echo "✅ Telegram 已配置"
+            echo "  TELEGRAM_BOT_TOKEN 长度=${#TELEGRAM_BOT_TOKEN}, 开头=${TELEGRAM_BOT_TOKEN:0:6}..."
+            echo "  TELEGRAM_CHAT_ID   长度=${#TELEGRAM_CHAT_ID}, 值开头=${TELEGRAM_CHAT_ID:0:4}..."
+          fi
 
       - name: 只查看状态（不消耗广告）
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status'
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           xvfb-run -a python3 voer_renew.py --status
 
@@ -122,6 +140,8 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # 可选：覆盖默认值
           # VOER_ADS_PER_EXTENSION: "3"
           # VOER_AD_DURATION_SEC: "35"
@@ -135,7 +155,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshot
-          path: debug_screenshot.png
+          path: |
+            debug_screenshot.png
+            renew_screenshot.png
           if-no-files-found: ignore
 
       - name: 续期后再次确认状态
@@ -143,6 +165,8 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "----- 当前服务器状态 -----"
           xvfb-run -a python3 voer_renew.py --status || true
