@@ -444,6 +444,7 @@ def run_server(cfg, server_id):
         return True
 
     success = False
+    entered_direct = False
     before = {}
     now = {}
     shot = pathlib.Path(_shot_name("renew_screenshot.png"))
@@ -493,12 +494,29 @@ def run_server(cfg, server_id):
                 before.get("sessionExtensionsToday"),
             )
 
+            # 今日已达上限时面板会隐藏续期入口，直接跳过（不算失败，不浪费 80 秒搜索）
+            # 返回 None 表示「跳过」，区别于 True=成功 / False=失败
+            if int(before.get("sessionExtensionsToday") or 0) >= 4:
+                log("今日续期次数已满（4/4），平台已隐藏续期入口，跳过该服务器")
+                return None
+
             for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
                 hit = click_anywhere(page, [accept_txt], 3000)
                 if hit:
                     log(f"已点同意弹窗: {hit}")
                     break
 
+            watch_labels = [
+                "觀看廣告",
+                "观看广告",
+                "Watch ad",
+                "Watch Ad",
+                "Watch ads",
+                "Watch Ads",
+                "Watch",
+                "开始",
+                "開始",
+            ]
             extend_labels = [
                 "延伸",
                 "延长",
@@ -516,7 +534,21 @@ def run_server(cfg, server_id):
             hit = click_anywhere(page, extend_labels, 45000)
             if not hit:
                 page.wait_for_timeout(5000)
+                # 弹窗（Cookie/公告）可能中途弹出挡住按钮，再点一次
+                for accept_txt in ("Accept", "Accept all", "同意", "接受", "OK"):
+                    if click_anywhere(page, [accept_txt], 2000):
+                        log(f"再次点掉弹窗: {accept_txt}")
                 hit = click_anywhere(page, extend_labels, 30000, exact=False)
+            if not hit:
+                # 部分版本面板没有「延伸」入口，续期入口就是 Watch ad 按钮本身
+                log("未找到「延伸」入口，尝试直接点击 Watch ad…")
+                hit2 = click_anywhere(page, watch_labels, 30000) or click_anywhere(
+                    page, watch_labels, 15000, exact=False
+                )
+                if hit2:
+                    log(f"已直接点击 Watch ad 作为续期入口: {hit2}")
+                    hit = "Watch ad(直入)"
+                    entered_direct = True
             if not hit:
                 log("未找到续期入口按钮")
                 dump_page_debug(page, "找不到延伸按钮")
@@ -534,24 +566,14 @@ def run_server(cfg, server_id):
             log(f"已点击续期入口: {hit}")
             page.wait_for_timeout(3000)
 
-            watch_labels = [
-                "觀看廣告",
-                "观看广告",
-                "Watch ad",
-                "Watch Ad",
-                "Watch ads",
-                "Watch Ads",
-                "Watch",
-                "开始",
-                "開始",
-            ]
-            hit2 = click_anywhere(page, watch_labels, 30000)
-            if not hit2:
-                hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
-            if not hit2:
-                log("未找到「观看广告」按钮（可能已直接进入广告流程）")
-            else:
-                log(f"已点击观看广告: {hit2}")
+            if not entered_direct:
+                hit2 = click_anywhere(page, watch_labels, 30000)
+                if not hit2:
+                    hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
+                if not hit2:
+                    log("未找到「观看广告」按钮（可能已直接进入广告流程）")
+                else:
+                    log(f"已点击观看广告: {hit2}")
             log("已打开广告流程，等待 Ad ready…")
             page.wait_for_timeout(8000)
 
@@ -683,11 +705,16 @@ def main():
     log("全部服务器处理完毕，结果汇总:")
     fail = 0
     for sid, ok in results:
-        mark = "✅ 成功" if ok else "❌ 失败"
-        if not ok:
+        if ok is True:
+            mark = "✅ 成功"
+        elif ok is None:
+            mark = "⏭️ 跳过（今日已满 4 次）"
+        else:
+            mark = "❌ 失败"
+        if ok is False:
             fail += 1
         log(f"  {mark}  {sid[:8]}…")
-    log(f"合计: {total - fail}/{total} 台成功")
+    log(f"合计: 成功/跳过 {total - fail}/{total} 台（失败 {fail} 台）")
     log("=" * 60)
     if fail:
         sys.exit(3)
