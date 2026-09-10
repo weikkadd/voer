@@ -205,25 +205,71 @@ def api_state(cfg):
         raise SystemExit(1) from e
 
 
-def click_anywhere(page, texts, timeout_ms):
+def click_anywhere(page, texts, timeout_ms, exact=True):
     """在所有 frame（含跨进程 iframe）里找文本并真实点击"""
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         for frame in page.frames:
             for t in texts:
-                for maker in (
-                    lambda: frame.get_by_text(t, exact=True).first,
-                    lambda: frame.get_by_role("button", name=t).first,
-                ):
+                makers = [
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=exact).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=exact).first,
+                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                ]
+                for maker in makers:
                     try:
                         loc = maker()
                         if loc.count() and loc.is_visible():
                             loc.click(timeout=3000)
-                            return f"{t}@{frame.url[:45]}"
+                            return f"{t}@{frame.url[:60]}"
                     except Exception:
                         pass
-        time.sleep(1.5)
+        time.sleep(1.2)
     return None
+
+
+def dump_page_debug(page, tag="debug"):
+    """失败时打印页面上可见按钮/链接文字，便于排查文案变化"""
+    log(f"----- 页面诊断 ({tag}) -----")
+    log(f"URL: {page.url}")
+    try:
+        title = page.title()
+        log(f"Title: {title}")
+    except Exception:
+        pass
+    texts = []
+    try:
+        for frame in page.frames:
+            for role in ("button", "link"):
+                try:
+                    locs = frame.get_by_role(role).all()
+                    for loc in locs[:40]:
+                        try:
+                            if loc.is_visible():
+                                t = (loc.inner_text(timeout=500) or "").strip()
+                                if t and t not in texts:
+                                    texts.append(t)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+    except Exception as e:
+        log(f"收集按钮失败: {e}")
+    if texts:
+        log("可见按钮/链接文字:")
+        for t in texts[:50]:
+            log(f"  - {t!r}")
+    else:
+        log("未收集到可见按钮文字")
+    # 尝试截图（CI 里可在后续步骤上传）
+    try:
+        shot = pathlib.Path("debug_screenshot.png")
+        page.screenshot(path=str(shot), full_page=True)
+        log(f"已保存截图: {shot.resolve()}")
+    except Exception as e:
+        log(f"截图失败: {e}")
+    log("----- 诊断结束 -----")
 
 
 def main():
@@ -270,8 +316,13 @@ def main():
             ]
         )
         page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_timeout(7000)
+        log(f"打开页面: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(5000)
 
         before = api_state(cfg)
         log(
@@ -283,13 +334,46 @@ def main():
             before.get("sessionExtensionsToday"),
         )
 
-        try:
-            page.get_by_role("button", name="Accept").first.click(timeout=3000)
-        except Exception:
-            pass
-        page.get_by_role("button", name="延伸", exact=True).first.click()
-        page.wait_for_timeout(2500)
-        page.get_by_role("button", name="觀看廣告", exact=True).first.click()
+        # 关闭可能的 Cookie/同意弹窗
+        for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
+            hit = click_anywhere(page, [accept_txt], 3000)
+            if hit:
+                log(f"已点同意弹窗: {hit}")
+                break
+
+        # 续期入口按钮：兼容简中/繁中/英文等多种文案
+        extend_labels = [
+            "延伸", "延长", "延長", "续期", "續期",
+            "Extend", "Extend session", "Extend Session",
+            "Renew", "Watch ads", "Watch Ads",
+        ]
+        log("正在寻找「续期/延伸」按钮…")
+        hit = click_anywhere(page, extend_labels, 45000)
+        if not hit:
+            # 再等一会儿，页面可能还在加载
+            page.wait_for_timeout(5000)
+            hit = click_anywhere(page, extend_labels, 30000, exact=False)
+        if not hit:
+            log("未找到续期入口按钮")
+            dump_page_debug(page, "找不到延伸按钮")
+            raise SystemExit(2)
+        log(f"已点击续期入口: {hit}")
+        page.wait_for_timeout(3000)
+
+        # 观看广告确认按钮
+        watch_labels = [
+            "觀看廣告", "观看广告", "观看广告", "觀看廣告",
+            "Watch ad", "Watch Ad", "Watch ads", "Watch Ads",
+            "Watch", "开始", "開始",
+        ]
+        hit2 = click_anywhere(page, watch_labels, 30000)
+        if not hit2:
+            hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
+        if not hit2:
+            log("未找到「观看广告」按钮（可能已直接进入广告流程）")
+            dump_page_debug(page, "找不到观看广告按钮")
+        else:
+            log(f"已点击观看广告: {hit2}")
         log("已打开广告流程，等待 Ad ready…")
         page.wait_for_timeout(8000)
 
