@@ -261,10 +261,20 @@ def load_config():
 
     log(f"server_id 长度={len(sid)}, 开头={sid[:8]}...")
     log(f"token 诊断: {_jwt_hint(token)}")
+    # 诊断环境变量是否真正传入（不打印完整 secret）
+    raw_tg_t = os.environ.get("TELEGRAM_BOT_TOKEN")
+    raw_tg_c = os.environ.get("TELEGRAM_CHAT_ID")
+    log(
+        f"环境变量探测: TELEGRAM_BOT_TOKEN={'已设置 len='+str(len(raw_tg_t)) if raw_tg_t else '空/未传入'}, "
+        f"TELEGRAM_CHAT_ID={'已设置 len='+str(len(raw_tg_c)) if raw_tg_c else '空/未传入'}"
+    )
     if _tg_enabled(cfg):
         log("Telegram 通知: 已启用")
     else:
-        log("Telegram 通知: 未配置（设置 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID 可开启）")
+        log("Telegram 通知: 未配置（需同时设置 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID）")
+        log("  GitHub: Settings → Secrets and variables → Actions")
+        log("  名称必须一字不差：TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        log("  并确保仓库里的 .github/workflows/voer-renew.yml 已更新（会把 secrets 注入 env）")
     if os.environ.get("VOER_SERVER_ID"):
         log("配置来源: 环境变量")
     elif CONFIG_PATH.exists():
