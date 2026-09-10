@@ -39,8 +39,8 @@
 
 | 环境变量 | 是否必须 | 说明 |
 |----------|----------|------|
-| `VOER_SERVER_ID` | **必须** | 服务器 UUID |
-| `VOER_TOKEN` | **必须** | 登录 Cookie 中的 JWT（约 7 天有效） |
+| `VOER_SERVER_ID` | **必须** | 服务器 UUID。**支持多台**：用英文逗号分隔，如 `uuid1,uuid2`（同一账号） |
+| `VOER_TOKEN` | **必须** | 登录 Cookie 中的 JWT（约 7 天有效；同一账号所有服务器共用一个） |
 | `TELEGRAM_BOT_TOKEN` | 可选 | Telegram 机器人 Token，用于通知 |
 | `TELEGRAM_CHAT_ID` | 可选 | Telegram 聊天 / 群组 ID |
 | `VOER_ADS_PER_EXTENSION` | 可选 | 每次需要的广告数，默认 `3` |
@@ -63,6 +63,14 @@
    ```
 
 4. **复制 `/panel/server/` 后面那一整串 UUID** → 这就是 `VOER_SERVER_ID`
+
+   **一个账号有多台服务器？** 把每台的 UUID 都复制下来，用英文逗号拼在一起即可，例如：
+
+   ```text
+   58d72957-xxxx-xxxx-xxxx-xxxxxxxxxxxx,9a1b2c3d-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+   ```
+
+   token 是**账号级**的，两台服务器共用同一个 token，不需要分开获取。脚本会自动逐台续期，每台独立截图、独立通知；一台失败不影响另一台。
 
 #### 2. 获取 `VOER_TOKEN`
 

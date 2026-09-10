@@ -33,6 +33,7 @@ import urllib.error
 import urllib.parse
 import base64
 import mimetypes
+import re
 
 BASE = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
@@ -259,7 +260,20 @@ def load_config():
         log("=" * 60)
         sys.exit(1)
 
-    log(f"server_id 长度={len(sid)}, 开头={sid[:8]}...")
+    # 多服务器支持：VOER_SERVER_ID / server_id 可填多个 UUID，
+    # 用逗号、分号或空白分隔（同一账号的 token 对所有服务器通用）
+    ids = [x for x in re.split(r"[,;\s]+", sid.strip()) if x]
+    seen = set()
+    server_ids = []
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            server_ids.append(x)
+    cfg["server_ids"] = server_ids
+
+    log(f"server_id 数量={len(server_ids)}")
+    for x in server_ids:
+        log(f"  - {x[:8]}…")
     log(f"token 诊断: {_jwt_hint(token)}")
     # 诊断环境变量是否真正传入（不打印完整 secret）
     raw_tg_t = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -283,8 +297,9 @@ def load_config():
     return cfg
 
 
-def api_state(cfg):
-    url = f"https://voer.host/api/servers/{cfg['server_id']}"
+def api_state(cfg, server_id=None):
+    sid = server_id or cfg["server_id"]
+    url = f"https://voer.host/api/servers/{sid}"
     req = urllib.request.Request(
         url,
         headers={
@@ -344,8 +359,17 @@ def click_anywhere(page, texts, timeout_ms, exact=True):
     return None
 
 
+def _shot_name(base: str) -> str:
+    """多服务器时给截图文件名加编号后缀：renew_screenshot.png -> renew_screenshot_2.png"""
+    tag = os.environ.get("VOER_SHOT_TAG", "1")
+    if tag == "1":
+        return base
+    p = pathlib.Path(base)
+    return f"{p.stem}_{tag}{p.suffix}"
+
+
 def take_screenshot(page, name="screenshot.png") -> pathlib.Path:
-    path = pathlib.Path(name)
+    path = pathlib.Path(_shot_name(name))
     try:
         page.screenshot(path=str(path), full_page=True)
         log(f"截图已保存: {path.resolve()}")
@@ -388,14 +412,13 @@ def dump_page_debug(page, tag="debug"):
     log("----- 诊断结束 -----")
 
 
-def main():
-    cfg = load_config()
-    server_id = cfg["server_id"]
+def run_server(cfg, server_id):
+    """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败。"""
     url = f"https://voer.host/panel/server/{server_id}"
     short_id = server_id[:8] + "…"
 
     if "--status" in sys.argv:
-        s = api_state(cfg)
+        s = api_state(cfg, server_id)
         for k in (
             "status",
             "sessionExpiresAt",
@@ -418,12 +441,12 @@ def main():
                     f"今日续期: {s.get('sessionExtensionsToday')}",
                 ],
             )
-        return
+        return True
 
     success = False
     before = {}
     now = {}
-    shot = pathlib.Path("renew_screenshot.png")
+    shot = pathlib.Path(_shot_name("renew_screenshot.png"))
 
     with sync_playwright() as p:
         launch = dict(
@@ -460,7 +483,7 @@ def main():
                 pass
             page.wait_for_timeout(5000)
 
-            before = api_state(cfg)
+            before = api_state(cfg, server_id)
             log(
                 "当前到期:",
                 before.get("sessionExpiresAt"),
@@ -505,9 +528,9 @@ def main():
                         "原因: 未找到「延伸/续期」按钮",
                         "请查看 Actions 日志或 debug 截图",
                     ],
-                    photo=pathlib.Path("debug_screenshot.png"),
+                    photo=pathlib.Path(_shot_name("debug_screenshot.png")),
                 )
-                raise SystemExit(2)
+                return False
             log(f"已点击续期入口: {hit}")
             page.wait_for_timeout(3000)
 
@@ -552,7 +575,7 @@ def main():
             end = time.time() + 180
             while time.time() < end:
                 try:
-                    now = api_state(cfg)
+                    now = api_state(cfg, server_id)
                 except SystemExit:
                     now = None
                 except Exception:
@@ -597,9 +620,9 @@ def main():
                     f"服务器: <code>{short_id}</code>",
                     f"错误: <code>{e}</code>",
                 ],
-                photo=pathlib.Path("debug_screenshot.png"),
+                photo=pathlib.Path(_shot_name("debug_screenshot.png")),
             )
-            raise
+            return False
         finally:
             page.wait_for_timeout(1500)
             browser.close()
@@ -630,7 +653,44 @@ def main():
             ],
             photo=shot if shot.exists() else None,
         )
-        raise SystemExit(3)
+        return False
+
+
+def main():
+    cfg = load_config()
+    server_ids = cfg.get("server_ids") or [cfg["server_id"]]
+
+    total = len(server_ids)
+    results = []
+    for idx, sid in enumerate(server_ids, 1):
+        log("=" * 60)
+        log(f"[{idx}/{total}] 开始处理服务器 {sid[:8]}…")
+        log("=" * 60)
+        # 每台服务器用独立截图文件名，避免互相覆盖
+        os.environ["VOER_SHOT_TAG"] = str(idx)
+        try:
+            ok = run_server(cfg, sid)
+        except SystemExit as e:
+            # api_state 里 401/403 会 SystemExit(1)：token 失效对所有服务器一样，直接终止
+            log(f"服务器 {sid[:8]}… 触发致命错误（exit={e.code}），停止全部任务")
+            raise
+        except Exception as e:
+            log(f"服务器 {sid[:8]}… 发生未预期异常: {e}")
+            ok = False
+        results.append((sid, ok))
+
+    log("=" * 60)
+    log("全部服务器处理完毕，结果汇总:")
+    fail = 0
+    for sid, ok in results:
+        mark = "✅ 成功" if ok else "❌ 失败"
+        if not ok:
+            fail += 1
+        log(f"  {mark}  {sid[:8]}…")
+    log(f"合计: {total - fail}/{total} 台成功")
+    log("=" * 60)
+    if fail:
+        sys.exit(3)
 
 
 if __name__ == "__main__":
