@@ -9,8 +9,10 @@ Voer.host 免费服务器会话续期（Playwright 版）
 限制：每 UTC 日最多 4 次、每会话最多 4 次（每次 +4h）。
 
 优先读取环境变量（适合 GitHub Actions / Docker / cron）：
-    VOER_SERVER_ID   服务器 UUID
-    VOER_TOKEN       Cookie 里的 token（JWT）
+    VOER_SERVER_ID        服务器 UUID（必须）
+    VOER_TOKEN            Cookie 里的 token JWT（必须）
+    TELEGRAM_BOT_TOKEN    Telegram Bot Token（可选，用于通知）
+    TELEGRAM_CHAT_ID      Telegram Chat ID（可选，用于通知）
 
 也支持本地 config.json（环境变量优先级更高）。
 
@@ -28,7 +30,9 @@ import time
 import pathlib
 import urllib.request
 import urllib.error
+import urllib.parse
 import base64
+import mimetypes
 
 BASE = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
@@ -40,10 +44,12 @@ UA = (
 DEFAULT_CONFIG = {
     "server_id": "在这里填服务器 UUID（面板地址 /panel/server/ 后面那串）",
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
-    "ads_per_extension": 3,  # 每次续期需要的广告数
-    "ad_duration_sec": 32,  # 单个广告播放时长，按实际适当加大
-    "headless": False,  # 必须为 False，headless 下广告不会发奖励
-    "use_system_chrome": False,  # True = 用系统 Chrome；False = 用 playwright 自带 chromium
+    "ads_per_extension": 3,
+    "ad_duration_sec": 32,
+    "headless": False,
+    "use_system_chrome": False,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
 }
 
 from playwright.sync_api import sync_playwright
@@ -53,8 +59,137 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Telegram 通知
+# ---------------------------------------------------------------------------
+def _tg_enabled(cfg) -> bool:
+    return bool(cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"))
+
+
+def tg_send_message(cfg, text: str) -> bool:
+    """发送纯文本消息到 Telegram。"""
+    if not _tg_enabled(cfg):
+        return False
+    token = cfg["telegram_bot_token"]
+    chat_id = cfg["telegram_chat_id"]
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
+    body = urllib.parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+    ).encode()
+    req = urllib.request.Request(
+        api,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+            if data.get("ok"):
+                log("Telegram 文本通知已发送")
+                return True
+            log(f"Telegram 发送失败: {data}")
+            return False
+    except Exception as e:
+        log(f"Telegram 发送异常: {e}")
+        return False
+
+
+def tg_send_photo(cfg, photo_path: pathlib.Path, caption: str = "") -> bool:
+    """发送图片（截图）到 Telegram。"""
+    if not _tg_enabled(cfg):
+        return False
+    if not photo_path.exists():
+        log(f"截图不存在，跳过发图: {photo_path}")
+        return False
+    token = cfg["telegram_bot_token"]
+    chat_id = str(cfg["telegram_chat_id"])
+    api = f"https://api.telegram.org/bot{token}/sendPhoto"
+
+    boundary = f"----VoerBoundary{int(time.time())}"
+    filename = photo_path.name
+    file_data = photo_path.read_bytes()
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+
+    parts = []
+    # chat_id
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}\r\n".encode()
+    )
+    # caption
+    if caption:
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="caption"\r\n\r\n'
+            f"{caption}\r\n".encode()
+        )
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="parse_mode"\r\n\r\n'
+            f"HTML\r\n".encode()
+        )
+    # photo
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n".encode()
+        + file_data
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        api,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": UA,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode())
+            if data.get("ok"):
+                log("Telegram 截图已发送")
+                return True
+            log(f"Telegram 发图失败: {data}")
+            return False
+    except Exception as e:
+        log(f"Telegram 发图异常: {e}")
+        return False
+
+
+def notify(cfg, title: str, lines: list, photo: pathlib.Path | None = None):
+    """统一通知入口：有 TG 配置就发，没有就只打日志。"""
+    text = f"<b>{title}</b>\n" + "\n".join(lines)
+    log("通知内容:\n" + text.replace("<b>", "").replace("</b>", ""))
+    if not _tg_enabled(cfg):
+        log("未配置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，跳过 TG 通知")
+        return
+    if photo and photo.exists():
+        # 图片 caption 最长约 1024，超长则先发图再发文字
+        if len(text) <= 1000:
+            tg_send_photo(cfg, photo, caption=text)
+        else:
+            tg_send_photo(cfg, photo, caption=title)
+            tg_send_message(cfg, text)
+    else:
+        tg_send_message(cfg, text)
+
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
 def _jwt_hint(token: str) -> str:
-    """返回 token 的安全提示信息（不泄露完整内容）。"""
     t = (token or "").strip()
     if not t:
         return "空"
@@ -64,7 +199,6 @@ def _jwt_hint(token: str) -> str:
         hint += "  【警告：标准 JWT 应有 3 段用 . 分隔，可能复制不完整】"
     if not t.startswith("eyJ"):
         hint += "  【警告：正常 JWT 一般以 eyJ 开头】"
-    # 尝试解析 payload 里的 exp
     try:
         if len(parts) >= 2:
             pad = parts[1] + "=" * (-len(parts[1]) % 4)
@@ -72,6 +206,7 @@ def _jwt_hint(token: str) -> str:
             exp = payload.get("exp")
             if exp:
                 import datetime
+
                 exp_dt = datetime.datetime.utcfromtimestamp(exp)
                 now = datetime.datetime.utcnow()
                 if exp_dt < now:
@@ -86,10 +221,8 @@ def _jwt_hint(token: str) -> str:
 
 
 def load_config():
-    """优先读环境变量，再合并 config.json（如果存在）。"""
     cfg = dict(DEFAULT_CONFIG)
 
-    # 1. 本地 config.json（可选）
     if CONFIG_PATH.exists():
         try:
             file_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -97,8 +230,6 @@ def load_config():
         except Exception as e:
             log(f"读取 config.json 失败: {e}")
 
-    # 2. 环境变量覆盖（最高优先级，适合 CI / Docker）
-    # 注意：去掉首尾空白和可能的引号
     env_sid = os.environ.get("VOER_SERVER_ID", "").strip().strip('"').strip("'")
     env_token = os.environ.get("VOER_TOKEN", "").strip().strip('"').strip("'")
     if env_sid:
@@ -106,45 +237,36 @@ def load_config():
     if env_token:
         cfg["token"] = env_token
 
-    # 可选覆盖数字配置
+    # Telegram（环境变量优先）
+    env_tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
+    env_tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+    if env_tg_token:
+        cfg["telegram_bot_token"] = env_tg_token
+    if env_tg_chat:
+        cfg["telegram_chat_id"] = env_tg_chat
+
     if os.environ.get("VOER_ADS_PER_EXTENSION"):
         cfg["ads_per_extension"] = int(os.environ["VOER_ADS_PER_EXTENSION"])
     if os.environ.get("VOER_AD_DURATION_SEC"):
         cfg["ad_duration_sec"] = int(os.environ["VOER_AD_DURATION_SEC"])
 
-    # 检查必填项
     sid = cfg.get("server_id", "")
     token = cfg.get("token", "")
-    if (
-        not sid
-        or "在这里填" in sid
-        or not token
-        or "在这里填" in token
-    ):
+    if not sid or "在这里填" in sid or not token or "在这里填" in token:
         log("=" * 60)
-        log("缺少必要配置！请设置以下任一方式：")
-        log("")
-        log("【推荐】环境变量（GitHub Actions / Docker / 系统环境）：")
-        log("  export VOER_SERVER_ID='你的服务器UUID'")
-        log("  export VOER_TOKEN='你的JWT token'")
-        log("")
-        log("【本地】复制 config.example.json 为 config.json 并填写")
-        log("  cp config.example.json config.json")
-        log("")
-        log("如何获取值：")
-        log("  1. server_id = 浏览器打开面板后，地址栏")
-        log("     https://voer.host/panel/server/ 后面那一串 UUID")
-        log("  2. token = 浏览器 F12 → Application(应用) → Cookies")
-        log("     → 选 voer.host → 找到 name=token 的值（以 eyJ 开头的 JWT）")
-        log("     大约 7 天过期，过期后重新复制即可")
+        log("缺少必要配置！请设置 VOER_SERVER_ID 和 VOER_TOKEN")
+        log("可选：TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID 用于通知")
         log("=" * 60)
         sys.exit(1)
 
-    # 打印安全诊断信息（不泄露完整 token）
     log(f"server_id 长度={len(sid)}, 开头={sid[:8]}...")
     log(f"token 诊断: {_jwt_hint(token)}")
+    if _tg_enabled(cfg):
+        log("Telegram 通知: 已启用")
+    else:
+        log("Telegram 通知: 未配置（设置 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID 可开启）")
     if os.environ.get("VOER_SERVER_ID"):
-        log("配置来源: 环境变量 VOER_SERVER_ID / VOER_TOKEN")
+        log("配置来源: 环境变量")
     elif CONFIG_PATH.exists():
         log("配置来源: 本地 config.json")
 
@@ -152,7 +274,6 @@ def load_config():
 
 
 def api_state(cfg):
-    """调用 API 获取服务器状态，失败时给出明确原因。"""
     url = f"https://voer.host/api/servers/{cfg['server_id']}"
     req = urllib.request.Request(
         url,
@@ -181,23 +302,8 @@ def api_state(cfg):
             log(f"响应内容: {body}")
         if e.code in (401, 403):
             log("")
-            log("【401/403 常见原因】")
-            log("  1. VOER_TOKEN 已过期（约 7 天）→ 重新从浏览器复制")
-            log("  2. token 复制不完整（JWT 必须有三段：xxxxx.yyyyy.zzzzz）")
-            log("  3. Secret 里多了空格、换行或引号")
-            log("  4. 复制了错误的 Cookie（必须是 name=token 那一项）")
-            log("")
-            log("【正确重新获取 token 步骤】")
-            log("  ① 浏览器打开 https://voer.host 并登录")
-            log("  ② 按 F12 → Application（应用）→ Cookies → voer.host")
-            log("  ③ 找到 Name = token 的行，完整复制 Value（以 eyJ 开头）")
-            log("  ④ GitHub: Settings → Secrets → 更新 VOER_TOKEN")
-            log("     本地: 更新环境变量或 config.json")
-            log("  ⑤ 再跑一次 --status 验证")
-            log("")
+            log("【401/403】token 过期或错误，请重新从浏览器复制 VOER_TOKEN")
             log(f"当前 token 诊断: {_jwt_hint(cfg['token'])}")
-        elif e.code == 404:
-            log("【404】server_id 可能写错，请检查面板地址栏里的 UUID")
         log("=" * 60)
         raise SystemExit(1) from e
     except urllib.error.URLError as e:
@@ -206,7 +312,6 @@ def api_state(cfg):
 
 
 def click_anywhere(page, texts, timeout_ms, exact=True):
-    """在所有 frame（含跨进程 iframe）里找文本并真实点击"""
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         for frame in page.frames:
@@ -229,13 +334,21 @@ def click_anywhere(page, texts, timeout_ms, exact=True):
     return None
 
 
+def take_screenshot(page, name="screenshot.png") -> pathlib.Path:
+    path = pathlib.Path(name)
+    try:
+        page.screenshot(path=str(path), full_page=True)
+        log(f"截图已保存: {path.resolve()}")
+    except Exception as e:
+        log(f"截图失败: {e}")
+    return path
+
+
 def dump_page_debug(page, tag="debug"):
-    """失败时打印页面上可见按钮/链接文字，便于排查文案变化"""
     log(f"----- 页面诊断 ({tag}) -----")
     log(f"URL: {page.url}")
     try:
-        title = page.title()
-        log(f"Title: {title}")
+        log(f"Title: {page.title()}")
     except Exception:
         pass
     texts = []
@@ -243,8 +356,7 @@ def dump_page_debug(page, tag="debug"):
         for frame in page.frames:
             for role in ("button", "link"):
                 try:
-                    locs = frame.get_by_role(role).all()
-                    for loc in locs[:40]:
+                    for loc in frame.get_by_role(role).all()[:40]:
                         try:
                             if loc.is_visible():
                                 t = (loc.inner_text(timeout=500) or "").strip()
@@ -262,13 +374,7 @@ def dump_page_debug(page, tag="debug"):
             log(f"  - {t!r}")
     else:
         log("未收集到可见按钮文字")
-    # 尝试截图（CI 里可在后续步骤上传）
-    try:
-        shot = pathlib.Path("debug_screenshot.png")
-        page.screenshot(path=str(shot), full_page=True)
-        log(f"已保存截图: {shot.resolve()}")
-    except Exception as e:
-        log(f"截图失败: {e}")
+    take_screenshot(page, "debug_screenshot.png")
     log("----- 诊断结束 -----")
 
 
@@ -276,6 +382,7 @@ def main():
     cfg = load_config()
     server_id = cfg["server_id"]
     url = f"https://voer.host/panel/server/{server_id}"
+    short_id = server_id[:8] + "…"
 
     if "--status" in sys.argv:
         s = api_state(cfg)
@@ -288,7 +395,25 @@ def main():
             "adsWatched",
         ):
             print(f"{k} = {s.get(k)}")
+        # status 也可发一条简短通知（可选）
+        if os.environ.get("TG_NOTIFY_STATUS") == "1":
+            notify(
+                cfg,
+                "📊 Voer 状态查询",
+                [
+                    f"服务器: <code>{short_id}</code>",
+                    f"状态: {s.get('status')}",
+                    f"到期: {s.get('sessionExpiresAt')}",
+                    f"累计续期: {s.get('sessionExtensions')}",
+                    f"今日续期: {s.get('sessionExtensionsToday')}",
+                ],
+            )
         return
+
+    success = False
+    before = {}
+    now = {}
+    shot = pathlib.Path("renew_screenshot.png")
 
     with sync_playwright() as p:
         launch = dict(
@@ -296,7 +421,7 @@ def main():
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--window-size=1400,1000",
-                "--no-sandbox",  # CI / Docker 常需要
+                "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
         )
@@ -316,109 +441,186 @@ def main():
             ]
         )
         page = ctx.new_page()
-        log(f"打开页面: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-        page.wait_for_timeout(5000)
-
-        before = api_state(cfg)
-        log(
-            "当前到期:",
-            before.get("sessionExpiresAt"),
-            "| 已续期:",
-            before.get("sessionExtensions"),
-            "| 今日:",
-            before.get("sessionExtensionsToday"),
-        )
-
-        # 关闭可能的 Cookie/同意弹窗
-        for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
-            hit = click_anywhere(page, [accept_txt], 3000)
-            if hit:
-                log(f"已点同意弹窗: {hit}")
-                break
-
-        # 续期入口按钮：兼容简中/繁中/英文等多种文案
-        extend_labels = [
-            "延伸", "延长", "延長", "续期", "續期",
-            "Extend", "Extend session", "Extend Session",
-            "Renew", "Watch ads", "Watch Ads",
-        ]
-        log("正在寻找「续期/延伸」按钮…")
-        hit = click_anywhere(page, extend_labels, 45000)
-        if not hit:
-            # 再等一会儿，页面可能还在加载
-            page.wait_for_timeout(5000)
-            hit = click_anywhere(page, extend_labels, 30000, exact=False)
-        if not hit:
-            log("未找到续期入口按钮")
-            dump_page_debug(page, "找不到延伸按钮")
-            raise SystemExit(2)
-        log(f"已点击续期入口: {hit}")
-        page.wait_for_timeout(3000)
-
-        # 观看广告确认按钮
-        watch_labels = [
-            "觀看廣告", "观看广告", "观看广告", "觀看廣告",
-            "Watch ad", "Watch Ad", "Watch ads", "Watch Ads",
-            "Watch", "开始", "開始",
-        ]
-        hit2 = click_anywhere(page, watch_labels, 30000)
-        if not hit2:
-            hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
-        if not hit2:
-            log("未找到「观看广告」按钮（可能已直接进入广告流程）")
-            dump_page_debug(page, "找不到观看广告按钮")
-        else:
-            log(f"已点击观看广告: {hit2}")
-        log("已打开广告流程，等待 Ad ready…")
-        page.wait_for_timeout(8000)
-
-        total = int(cfg["ads_per_extension"])
-        for i in range(1, total + 1):
-            hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告"], 75000)
-            if not hit:
-                log(f"第 {i} 个 Watch ad 未找到，停止")
-                break
-            log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-            page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
-            closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
-            log(
-                f"第 {i} 个广告:",
-                f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-            )
-            page.wait_for_timeout(6000)
-
-        end = time.time() + 180
-        while time.time() < end:
+            log(f"打开页面: {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
             try:
-                now = api_state(cfg)
-            except SystemExit:
-                now = None
+                page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
-                now = None
-            if now and (
-                now.get("sessionExtensions", 0) > before.get("sessionExtensions", 0)
-                or now.get("sessionExpiresAt") != before.get("sessionExpiresAt")
-            ):
-                log(
-                    "续期成功 -> 新到期:",
-                    now.get("sessionExpiresAt"),
-                    "| 累计:",
-                    now.get("sessionExtensions"),
-                    "| 今日:",
-                    now.get("sessionExtensionsToday"),
-                )
-                break
-            time.sleep(10)
-        else:
-            log("未检测到续期生效，请检查窗口是否卡在某个广告上，或今日次数已用尽（最多 4 次）")
+                pass
+            page.wait_for_timeout(5000)
 
-        page.wait_for_timeout(3000)
-        browser.close()
+            before = api_state(cfg)
+            log(
+                "当前到期:",
+                before.get("sessionExpiresAt"),
+                "| 已续期:",
+                before.get("sessionExtensions"),
+                "| 今日:",
+                before.get("sessionExtensionsToday"),
+            )
+
+            for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
+                hit = click_anywhere(page, [accept_txt], 3000)
+                if hit:
+                    log(f"已点同意弹窗: {hit}")
+                    break
+
+            extend_labels = [
+                "延伸",
+                "延长",
+                "延長",
+                "续期",
+                "續期",
+                "Extend",
+                "Extend session",
+                "Extend Session",
+                "Renew",
+                "Watch ads",
+                "Watch Ads",
+            ]
+            log("正在寻找「续期/延伸」按钮…")
+            hit = click_anywhere(page, extend_labels, 45000)
+            if not hit:
+                page.wait_for_timeout(5000)
+                hit = click_anywhere(page, extend_labels, 30000, exact=False)
+            if not hit:
+                log("未找到续期入口按钮")
+                dump_page_debug(page, "找不到延伸按钮")
+                notify(
+                    cfg,
+                    "❌ Voer 续期失败",
+                    [
+                        f"服务器: <code>{short_id}</code>",
+                        "原因: 未找到「延伸/续期」按钮",
+                        "请查看 Actions 日志或 debug 截图",
+                    ],
+                    photo=pathlib.Path("debug_screenshot.png"),
+                )
+                raise SystemExit(2)
+            log(f"已点击续期入口: {hit}")
+            page.wait_for_timeout(3000)
+
+            watch_labels = [
+                "觀看廣告",
+                "观看广告",
+                "Watch ad",
+                "Watch Ad",
+                "Watch ads",
+                "Watch Ads",
+                "Watch",
+                "开始",
+                "開始",
+            ]
+            hit2 = click_anywhere(page, watch_labels, 30000)
+            if not hit2:
+                hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
+            if not hit2:
+                log("未找到「观看广告」按钮（可能已直接进入广告流程）")
+            else:
+                log(f"已点击观看广告: {hit2}")
+            log("已打开广告流程，等待 Ad ready…")
+            page.wait_for_timeout(8000)
+
+            total = int(cfg["ads_per_extension"])
+            for i in range(1, total + 1):
+                hit = click_anywhere(
+                    page, ["Watch ad", "觀看廣告", "观看广告"], 75000
+                )
+                if not hit:
+                    log(f"第 {i} 个 Watch ad 未找到，停止")
+                    break
+                log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
+                page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
+                closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
+                log(
+                    f"第 {i} 个广告:",
+                    f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
+                )
+                page.wait_for_timeout(6000)
+
+            end = time.time() + 180
+            while time.time() < end:
+                try:
+                    now = api_state(cfg)
+                except SystemExit:
+                    now = None
+                except Exception:
+                    now = None
+                if now and (
+                    now.get("sessionExtensions", 0)
+                    > before.get("sessionExtensions", 0)
+                    or now.get("sessionExpiresAt") != before.get("sessionExpiresAt")
+                ):
+                    log(
+                        "续期成功 -> 新到期:",
+                        now.get("sessionExpiresAt"),
+                        "| 累计:",
+                        now.get("sessionExtensions"),
+                        "| 今日:",
+                        now.get("sessionExtensionsToday"),
+                    )
+                    success = True
+                    break
+                time.sleep(10)
+            else:
+                log(
+                    "未检测到续期生效，请检查窗口是否卡在某个广告上，或今日次数已用尽（最多 4 次）"
+                )
+                now = now or {}
+
+            # 成功/失败都截一张最终画面
+            shot = take_screenshot(page, "renew_screenshot.png")
+
+        except SystemExit:
+            raise
+        except Exception as e:
+            log(f"运行异常: {e}")
+            try:
+                dump_page_debug(page, "异常")
+            except Exception:
+                pass
+            notify(
+                cfg,
+                "❌ Voer 续期异常",
+                [
+                    f"服务器: <code>{short_id}</code>",
+                    f"错误: <code>{e}</code>",
+                ],
+                photo=pathlib.Path("debug_screenshot.png"),
+            )
+            raise
+        finally:
+            page.wait_for_timeout(1500)
+            browser.close()
+
+    # 结束后发通知
+    if success:
+        notify(
+            cfg,
+            "✅ Voer 续期成功",
+            [
+                f"服务器: <code>{short_id}</code>",
+                f"原到期: {before.get('sessionExpiresAt')}",
+                f"新到期: <b>{now.get('sessionExpiresAt')}</b>",
+                f"累计续期: {now.get('sessionExtensions')}",
+                f"今日续期: {now.get('sessionExtensionsToday')}",
+            ],
+            photo=shot,
+        )
+    else:
+        notify(
+            cfg,
+            "⚠️ Voer 续期未生效",
+            [
+                f"服务器: <code>{short_id}</code>",
+                f"当前到期: {before.get('sessionExpiresAt')}",
+                f"累计: {before.get('sessionExtensions')} | 今日: {before.get('sessionExtensionsToday')}",
+                "可能原因: 广告未播完 / 今日已达 4 次上限 / 页面卡住",
+            ],
+            photo=shot if shot.exists() else None,
+        )
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
