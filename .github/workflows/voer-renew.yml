@@ -94,7 +94,18 @@ jobs:
             echo "获取方法见本文件顶部注释，或 README.md"
             exit 1
           fi
-          echo "✅ Secrets 已配置（值不会打印）"
+          # 只打印长度和开头，不泄露完整 secret
+          echo "✅ Secrets 已配置"
+          echo "  VOER_SERVER_ID 长度=${#VOER_SERVER_ID}, 开头=${VOER_SERVER_ID:0:8}..."
+          echo "  VOER_TOKEN     长度=${#VOER_TOKEN}, 开头=${VOER_TOKEN:0:8}..."
+          DOTS=$(echo -n "$VOER_TOKEN" | tr -cd '.' | wc -c)
+          echo "  VOER_TOKEN 中 . 的数量=$DOTS（标准 JWT 应为 2）"
+          if [[ ! "$VOER_TOKEN" == eyJ* ]]; then
+            echo "⚠️  警告：正常 JWT 一般以 eyJ 开头，当前开头异常，可能复制错了"
+          fi
+          if [ "$DOTS" -ne 2 ]; then
+            echo "⚠️  警告：标准 JWT 应有 2 个点（3 段），当前点数=$DOTS，可能复制不完整"
+          fi
 
       - name: 只查看状态（不消耗广告）
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status'
