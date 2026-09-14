@@ -707,6 +707,7 @@ def run_server(cfg, server_id):
             ],
             photo=shot,
         )
+        return True
     else:
         notify(
             cfg,
@@ -752,7 +753,7 @@ def main():
         if ok is True:
             mark = "✅ 成功"
         elif ok is None:
-            mark = "⏭️ 跳过（今日已满 4 次）"
+            mark = "⏭️ 跳过（今日已满 4 次，UTC 当日）"
         else:
             mark = "❌ 失败"
         if ok is False:
