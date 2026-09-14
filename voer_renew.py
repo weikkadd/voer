@@ -221,6 +221,36 @@ def _jwt_hint(token: str) -> str:
     return hint
 
 
+def today_used(server: dict) -> int:
+    """返回「今日（UTC）已续期次数」。
+
+    注意：API 里的 sessionExtensionsToday 是「上次记录时」的当日次数，
+    必须配合 sessionExtensionsDate 判断是否属于今天（UTC）。
+    日期不匹配时它已过期，应视为 0。
+    这与 voer.host 前端逻辑一致：
+        F = (String(sessionExtensionsDate).slice(0,10) === todayUTC) ? sessionExtensionsToday : 0
+    旧脚本只看 sessionExtensionsToday，跨 UTC 日会读到过期值（如 4）而误判「今日已满」。
+    """
+    import datetime
+
+    raw = server.get("sessionExtensionsToday") or 0
+    try:
+        raw = int(raw)
+    except Exception:
+        raw = 0
+    date_val = server.get("sessionExtensionsDate")
+    if not date_val:
+        # 没有日期字段时无法确认是否属于今天：保守返回 0，宁可尝试续期也不误跳过
+        return 0
+    try:
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if str(date_val)[:10] == today:
+            return max(0, raw)
+        return 0
+    except Exception:
+        return 0
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
 
@@ -424,10 +454,12 @@ def run_server(cfg, server_id):
             "sessionExpiresAt",
             "sessionExtensions",
             "sessionExtensionsToday",
+            "sessionExtensionsDate",
             "sessionDuration",
             "adsWatched",
         ):
             print(f"{k} = {s.get(k)}")
+        print(f"今日已续期(UTC, 计算值) = {today_used(s)} / 4")
         # status 也可发一条简短通知（可选）
         if os.environ.get("TG_NOTIFY_STATUS") == "1":
             notify(
@@ -438,7 +470,7 @@ def run_server(cfg, server_id):
                     f"状态: {s.get('status')}",
                     f"到期: {s.get('sessionExpiresAt')}",
                     f"累计续期: {s.get('sessionExtensions')}",
-                    f"今日续期: {s.get('sessionExtensionsToday')}",
+                    f"今日续期: {today_used(s)} / 4 (UTC)",
                 ],
             )
         return True
@@ -492,13 +524,25 @@ def run_server(cfg, server_id):
                 before.get("sessionExtensions"),
                 "| 今日:",
                 before.get("sessionExtensionsToday"),
+                f"(sessionExtensionsDate={before.get('sessionExtensionsDate')})",
             )
 
             # 今日已达上限时面板会隐藏续期入口，直接跳过（不算失败，不浪费 80 秒搜索）
             # 返回 None 表示「跳过」，区别于 True=成功 / False=失败
-            if int(before.get("sessionExtensionsToday") or 0) >= 4:
-                log("今日续期次数已满（4/4），平台已隐藏续期入口，跳过该服务器")
+            #
+            # 重要：必须用 today_used() 结合 sessionExtensionsDate 判断，
+            # 否则跨 UTC 日会读到过期的 sessionExtensionsToday（例如 4）而误判「今日已满」。
+            used_today = today_used(before)
+            if used_today >= 4:
+                log(f"今日续期次数已满（{used_today}/4，UTC 当日），平台已隐藏续期入口，跳过该服务器")
                 return None
+            if int(before.get("sessionExtensionsToday") or 0) >= 4 and used_today == 0:
+                log(
+                    "注意：sessionExtensionsToday="
+                    f"{before.get('sessionExtensionsToday')} 但 sessionExtensionsDate="
+                    f"{before.get('sessionExtensionsDate')} 不是今天（UTC），"
+                    "该计数已过期，按 0 处理，继续尝试续期"
+                )
 
             for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
                 hit = click_anywhere(page, [accept_txt], 3000)
@@ -613,7 +657,7 @@ def run_server(cfg, server_id):
                         "| 累计:",
                         now.get("sessionExtensions"),
                         "| 今日:",
-                        now.get("sessionExtensionsToday"),
+                        today_used(now),
                     )
                     success = True
                     break
@@ -659,7 +703,7 @@ def run_server(cfg, server_id):
                 f"原到期: {before.get('sessionExpiresAt')}",
                 f"新到期: <b>{now.get('sessionExpiresAt')}</b>",
                 f"累计续期: {now.get('sessionExtensions')}",
-                f"今日续期: {now.get('sessionExtensionsToday')}",
+                f"今日续期: {today_used(now)} / 4 (UTC)",
             ],
             photo=shot,
         )
@@ -670,7 +714,7 @@ def run_server(cfg, server_id):
             [
                 f"服务器: <code>{short_id}</code>",
                 f"当前到期: {before.get('sessionExpiresAt')}",
-                f"累计: {before.get('sessionExtensions')} | 今日: {before.get('sessionExtensionsToday')}",
+                f"累计: {before.get('sessionExtensions')} | 今日: {today_used(before)} / 4 (UTC)",
                 "可能原因: 广告未播完 / 今日已达 4 次上限 / 页面卡住",
             ],
             photo=shot if shot.exists() else None,
