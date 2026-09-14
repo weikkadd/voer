@@ -34,6 +34,7 @@ import urllib.parse
 import base64
 import mimetypes
 import re
+from datetime import datetime, timezone, timedelta
 
 BASE = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
@@ -52,6 +53,7 @@ DEFAULT_CONFIG = {
     "use_system_chrome": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
+    "tg_title": "Godlike 续期通知",   # TG 通知标题，可用环境变量 TG_TITLE 覆盖
 }
 
 from playwright.sync_api import sync_playwright
@@ -189,6 +191,106 @@ def notify(cfg, title: str, lines: list, photo: pathlib.Path | None = None):
 
 
 # ---------------------------------------------------------------------------
+# 通知内容格式化（Godlike 风格）
+# ---------------------------------------------------------------------------
+def fmt_local_time(dt=None) -> str:
+    """本地时间，格式 2026-09-14 11:10:00。"""
+    return (dt or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_duration(seconds) -> str:
+    """把秒数格式化成 23h 59m / 3h 05m。"""
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m"
+
+
+def seconds_until(iso_str) -> int | None:
+    """距离某个 ISO 时间还有多少秒（已过期返回 0，解析失败返回 None）。"""
+    if not iso_str:
+        return None
+    try:
+        t = str(iso_str).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+    except Exception:
+        return None
+
+
+def status_text(status) -> str:
+    """把服务器 status 映射成中文说明。"""
+    s = (status or "").lower()
+    if s in ("running", "online"):
+        return "✅ 服务器已在运行中，无需开机"
+    if s in ("stopped", "offline"):
+        return "⏹️ 服务器已停止"
+    if s in ("starting", "provisioning", "pending", "starting_node"):
+        return "🔄 服务器启动中"
+    if s in ("restarting", "migrating"):
+        return "🔄 服务器重启中"
+    if s == "maintenance":
+        return "🛠️ 系统维护中"
+    if s in ("crashed", "error", "provisioning_error", "supervisor_error"):
+        return "❌ 服务器异常"
+    return f"ℹ️ {status or '未知'}"
+
+
+def account_email_from_server(server) -> str:
+    """从服务器信息里取账号邮箱（server.access.owner.email）。"""
+    if not server:
+        return ""
+    owner = (server.get("access") or {}).get("owner") or {}
+    if isinstance(owner, dict):
+        for k in ("email", "displayName", "username"):
+            if owner.get(k):
+                return str(owner[k])
+    for k in ("ownerEmail", "email"):
+        if server.get(k):
+            return str(server[k])
+    return ""
+
+
+def fetch_account_email(cfg) -> str:
+    """调用 /api/auth/me 取账号邮箱（失败不影响续期）。"""
+    req = urllib.request.Request(
+        "https://voer.host/api/auth/me",
+        headers={
+            "Cookie": f"token={cfg['token']}",
+            "User-Agent": UA,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        user = data.get("user") or {}
+        return str(
+            user.get("email") or user.get("displayName") or user.get("username") or ""
+        )
+    except Exception as e:
+        log(f"获取账号信息失败（不影响续期）: {e}")
+        return ""
+
+
+def notify_godlike(cfg, account, server_id, result, uptime_sec, status):
+    """按固定模板发送续期通知（纯文本）。"""
+    lines = [
+        f"⏰运行时间: {fmt_local_time()}",
+        f"🖥️账号: {account or '—'}",
+        f"🖥️服务器: {server_id}",
+        f"🔢下次可续期: {fmt_duration(uptime_sec)}",
+        f"📊续期结果: {result}",
+        f"📊开机状态: {status_text(status)}",
+    ]
+    notify(cfg, cfg.get("tg_title") or "Godlike 续期通知", lines)
+
+
+# ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
 def _jwt_hint(token: str) -> str:
@@ -283,6 +385,9 @@ def load_config():
         cfg["ad_duration_sec"] = int(os.environ["VOER_AD_DURATION_SEC"])
     if os.environ.get("VOER_EXTENSIONS_PER_RUN"):
         cfg["extensions_per_run"] = int(os.environ["VOER_EXTENSIONS_PER_RUN"])
+    env_tg_title = os.environ.get("TG_TITLE", "").strip().strip('"').strip("'")
+    if env_tg_title:
+        cfg["tg_title"] = env_tg_title
 
     sid = cfg.get("server_id", "")
     token = cfg.get("token", "")
@@ -445,7 +550,7 @@ def dump_page_debug(page, tag="debug"):
     log("----- 诊断结束 -----")
 
 
-def run_server(cfg, server_id):
+def run_server(cfg, server_id, account=""):
     """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败。"""
     url = f"https://voer.host/panel/server/{server_id}"
     short_id = server_id[:8] + "…"
@@ -728,35 +833,39 @@ def run_server(cfg, server_id):
 
     # 结束后发通知
     if success:
-        summary = [
-            f"服务器: <code>{short_id}</code>",
-            f"原到期: {before.get('sessionExpiresAt')}",
-            f"新到期: <b>{now.get('sessionExpiresAt')}</b>",
-            f"本次续期: {rounds_ok} 次（+{rounds_ok * 4} 小时）",
-            f"累计续期: {now.get('sessionExtensions')}",
-            f"今日续期: {today_used(now)} / 4 (UTC)",
-        ]
-        if stop_reason:
-            summary.append(f"停止原因: {stop_reason}")
-        notify(cfg, "✅ Voer 续期成功", summary, photo=last_shot)
+        final_state = now or before
+        # 下次可续期 = 本会话到期 − 现在
+        uptime = seconds_until(final_state.get("sessionExpiresAt"))
+        if uptime is None:
+            uptime = seconds_until(before.get("sessionExpiresAt"))
+        result = f"✅续期成功（+{rounds_ok * 4}h，共 {rounds_ok} 次）"
+        notify_godlike(cfg, account, short_id, result, uptime, final_state.get("status"))
         return True
     else:
-        notify(
-            cfg,
-            "⚠️ Voer 续期未生效",
-            [
-                f"服务器: <code>{short_id}</code>",
-                f"当前到期: {before.get('sessionExpiresAt')}",
-                f"累计: {before.get('sessionExtensions')} | 今日: {today_used(before)} / 4 (UTC)",
-                "可能原因: 广告未播完 / 今日已达 4 次上限 / 页面卡住",
-            ],
-            photo=last_shot if last_shot.exists() else None,
+        final_state = now or before
+        uptime = seconds_until(final_state.get("sessionExpiresAt"))
+        reason = stop_reason or "未检测到续期生效"
+        notify_godlike(
+            cfg, account, short_id, f"⚠️续期未生效（{reason}）", uptime, final_state.get("status")
         )
         return False
+
 
 def main():
     cfg = load_config()
     server_ids = cfg.get("server_ids") or [cfg["server_id"]]
+
+    # 取账号邮箱（用于通知；失败不影响续期）
+    account = ""
+    if "--status" not in sys.argv:
+        account = fetch_account_email(cfg)
+        if account:
+            log(f"账号: {account}")
+    else:
+        try:
+            account = account_email_from_server(api_state(cfg, server_ids[0]))
+        except Exception:
+            account = ""
 
     total = len(server_ids)
     results = []
@@ -767,7 +876,7 @@ def main():
         # 每台服务器用独立截图文件名，避免互相覆盖
         os.environ["VOER_SHOT_TAG"] = str(idx)
         try:
-            ok = run_server(cfg, sid)
+            ok = run_server(cfg, sid, account=account)
         except SystemExit as e:
             # api_state 里 401/403 会 SystemExit(1)：token 失效对所有服务器一样，直接终止
             log(f"服务器 {sid[:8]}… 触发致命错误（exit={e.code}），停止全部任务")

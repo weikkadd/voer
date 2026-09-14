@@ -153,6 +153,7 @@ jobs:
           # VOER_ADS_PER_EXTENSION: "3"
           # VOER_AD_DURATION_SEC: "35"
           # VOER_EXTENSIONS_PER_RUN: "4"   # 单次运行内连续续期几次（默认 4 = 续满当日上限）
+          # TG_TITLE: "Godlike 续期通知"    # 自定义 TG 通知标题
         run: |
           echo "开始续期，预计 3～5 分钟..."
           xvfb-run -a python3 voer_renew.py

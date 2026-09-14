@@ -7,5 +7,6 @@
     "headless": false,
     "use_system_chrome": false,
     "telegram_bot_token": "",
-    "telegram_chat_id": ""
+    "telegram_chat_id": "",
+    "tg_title": "Godlike 续期通知"
 }
