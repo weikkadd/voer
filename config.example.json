@@ -3,6 +3,7 @@
     "token": "在这里填Cookie中的token（JWT，同一账号所有服务器共用）",
     "ads_per_extension": 3,
     "ad_duration_sec": 32,
+    "extensions_per_run": 4,
     "headless": false,
     "use_system_chrome": false,
     "telegram_bot_token": "",

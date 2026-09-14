@@ -1,5 +1,5 @@
 # Voer.host 免费服务器自动续期
-# 每天自动看 3 个激励广告，把会话延长 +4 小时
+# 每次运行会连续续期（每轮看 3 个激励广告 +4 小时），直到当日 4/4 或本会话 4/4 上限
 #
 # 使用前必须在仓库 Settings → Secrets and variables → Actions 里添加：
 #   VOER_SERVER_ID   = 服务器 UUID（支持多个！用英文逗号分隔即可，见下）
@@ -26,6 +26,8 @@
 # - 每 UTC 日每台最多续期 4 次
 # - 每个会话最多续期 4 次
 # - 每次成功 +4 小时
+# - 单次运行内会连续续期，直到当日 4/4 或本会话 4/4 为止（约 12～15 分钟）
+# - 想只续 1 次：把 VOER_EXTENSIONS_PER_RUN 设为 "1"
 # - headless 模式下广告不会发奖励，所以必须用 xvfb + headless=false
 
 name: Voer.host 会话续期
@@ -58,7 +60,7 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 30          # 单台 3～5 分钟；多台服务器按台数留足缓冲
+    timeout-minutes: 60          # 单台连续续满约 12～15 分钟；多台服务器按台数留足缓冲
 
     steps:
       - name: 检出代码
@@ -150,6 +152,7 @@ jobs:
           # 可选：覆盖默认值
           # VOER_ADS_PER_EXTENSION: "3"
           # VOER_AD_DURATION_SEC: "35"
+          # VOER_EXTENSIONS_PER_RUN: "4"   # 单次运行内连续续期几次（默认 4 = 续满当日上限）
         run: |
           echo "开始续期，预计 3～5 分钟..."
           xvfb-run -a python3 voer_renew.py

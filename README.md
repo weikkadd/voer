@@ -45,6 +45,7 @@
 | `TELEGRAM_CHAT_ID` | 可选 | Telegram 聊天 / 群组 ID |
 | `VOER_ADS_PER_EXTENSION` | 可选 | 每次需要的广告数，默认 `3` |
 | `VOER_AD_DURATION_SEC` | 可选 | 单个广告等待秒数，默认 `32` |
+| `VOER_EXTENSIONS_PER_RUN` | 可选 | 单次运行内连续续期几次，默认 `4`（即续满当日上限）；设 `1` 则每次只续 1 次 |
 
 本地也可用 `config.json`（由 `config.example.json` 复制），但**环境变量优先级更高**，适合 CI / Docker / cron。
 
@@ -208,18 +209,24 @@ export TELEGRAM_CHAT_ID='123456789'
    - `status`：只查看当前到期时间、今日已续次数（**不消耗广告**）
    - `renew`：真正看广告续期
 5. **第一次务必先跑 `status`**，确认 Secrets 正确、token 未过期
-6. 再跑 `renew`，等待约 3～5 分钟
+6. 再跑 `renew`，脚本会**在单次运行内连续续期**，直到当日 4/4 或本会话 4/4 上限（约 12～15 分钟）
 
 成功日志大致类似：
 
 ```text
 [xx:xx:xx] token 诊断: 长度=224, 段数=3, …【未过期，剩余约 167 小时】
 [xx:xx:xx] 当前到期: … | 已续期: 0 | 今日: 0
+[xx:xx:xx] 第 1/4 轮：今日 0/4 | 本会话累计 0/4 | 到期 …
 [xx:xx:xx] 已点击续期入口: …
 [xx:xx:xx] 已点击第 1/3 个 Watch ad …
-[xx:xx:xx] 续期成功 -> 新到期: … | 累计: 1 | 今日: 1
+[xx:xx:xx] 第 1 轮续期成功 -> 新到期: … | 累计: 1 | 今日: 1
+[xx:xx:xx] 第 2/4 轮：今日 1/4 | 本会话累计 1/4 | 到期 …
+…
+[xx:xx:xx] 第 4 轮续期成功 -> 新到期: … | 累计: 4 | 今日: 4
 [xx:xx:xx] Telegram 截图已发送
 ```
+
+> 只想每次运行续 1 次？把 Secret `VOER_EXTENSIONS_PER_RUN` 设为 `1`（或删掉，默认就是 4）。
 
 ### 3.4 定时规则
 
@@ -231,7 +238,7 @@ schedule:
 ```
 
 对应北京时间大约 **08:00、16:00、00:00**。  
-每天最多成功 4 次，建议不要设超过 3～4 次。  
+**单次运行就会续满当日 4/4**（除非中途失败或会话已达 4/4），所以**不需要**把 cron 设成每天 4 次——默认每天 3 次即可，多跑的那次会因当日已满而跳过，不会浪费。  
 修改：编辑 `.github/workflows/voer-renew.yml` 里的 `cron`。
 
 ### 3.5 失败时的截图
@@ -286,8 +293,11 @@ cp config.example.json config.json
 # 只看状态（不看广告、不消耗次数）
 python3 voer_renew.py --status
 
-# 真正续期（必须带虚拟显示）
+# 真正续期（必须带虚拟显示）；默认单次运行连续续满当日上限（最多 4 次）
 xvfb-run -a python3 voer_renew.py
+
+# 只想续 1 次：
+VOER_EXTENSIONS_PER_RUN=1 xvfb-run -a python3 voer_renew.py
 ```
 
 > `headless` 必须为 `false`，且要用 `xvfb-run`。纯无头模式下广告不会发奖励。
@@ -309,6 +319,7 @@ crontab -e
 ```
 
 建议先手动跑通 `--status` 和一次 `renew`，再挂 cron。
+单次运行会续满当日上限，所以无需频繁触发。
 
 ### GitHub Actions
 

@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
     "ads_per_extension": 3,
     "ad_duration_sec": 32,
+    "extensions_per_run": 4,   # 单次运行内最多连续续期几次（受平台每日/每会话 4 次上限约束）
     "headless": False,
     "use_system_chrome": False,
     "telegram_bot_token": "",
@@ -280,6 +281,8 @@ def load_config():
         cfg["ads_per_extension"] = int(os.environ["VOER_ADS_PER_EXTENSION"])
     if os.environ.get("VOER_AD_DURATION_SEC"):
         cfg["ad_duration_sec"] = int(os.environ["VOER_AD_DURATION_SEC"])
+    if os.environ.get("VOER_EXTENSIONS_PER_RUN"):
+        cfg["extensions_per_run"] = int(os.environ["VOER_EXTENSIONS_PER_RUN"])
 
     sid = cfg.get("server_id", "")
     token = cfg.get("token", "")
@@ -476,10 +479,38 @@ def run_server(cfg, server_id):
         return True
 
     success = False
-    entered_direct = False
     before = {}
     now = {}
-    shot = pathlib.Path(_shot_name("renew_screenshot.png"))
+    last_shot = pathlib.Path(_shot_name("renew_screenshot.png"))
+    # 单次运行内最多连续续期几次（受平台每日 4 次 / 每会话 4 次上限约束）
+    max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
+    rounds_ok = 0
+    stop_reason = ""
+
+    watch_labels = [
+        "觀看廣告",
+        "观看广告",
+        "Watch ad",
+        "Watch Ad",
+        "Watch ads",
+        "Watch Ads",
+        "Watch",
+        "开始",
+        "開始",
+    ]
+    extend_labels = [
+        "延伸",
+        "延长",
+        "延長",
+        "续期",
+        "續期",
+        "Extend",
+        "Extend session",
+        "Extend Session",
+        "Renew",
+        "Watch ads",
+        "Watch Ads",
+    ]
 
     with sync_playwright() as p:
         launch = dict(
@@ -527,7 +558,7 @@ def run_server(cfg, server_id):
                 f"(sessionExtensionsDate={before.get('sessionExtensionsDate')})",
             )
 
-            # 今日已达上限时面板会隐藏续期入口，直接跳过（不算失败，不浪费 80 秒搜索）
+            # 今日已达上限时面板会隐藏续期入口，直接跳过（不算失败，不浪费搜索时间）
             # 返回 None 表示「跳过」，区别于 True=成功 / False=失败
             #
             # 重要：必须用 today_used() 结合 sessionExtensionsDate 判断，
@@ -550,126 +581,128 @@ def run_server(cfg, server_id):
                     log(f"已点同意弹窗: {hit}")
                     break
 
-            watch_labels = [
-                "觀看廣告",
-                "观看广告",
-                "Watch ad",
-                "Watch Ad",
-                "Watch ads",
-                "Watch Ads",
-                "Watch",
-                "开始",
-                "開始",
-            ]
-            extend_labels = [
-                "延伸",
-                "延长",
-                "延長",
-                "续期",
-                "續期",
-                "Extend",
-                "Extend session",
-                "Extend Session",
-                "Renew",
-                "Watch ads",
-                "Watch Ads",
-            ]
-            log("正在寻找「续期/延伸」按钮…")
-            hit = click_anywhere(page, extend_labels, 45000)
-            if not hit:
-                page.wait_for_timeout(5000)
-                # 弹窗（Cookie/公告）可能中途弹出挡住按钮，再点一次
-                for accept_txt in ("Accept", "Accept all", "同意", "接受", "OK"):
-                    if click_anywhere(page, [accept_txt], 2000):
-                        log(f"再次点掉弹窗: {accept_txt}")
-                hit = click_anywhere(page, extend_labels, 30000, exact=False)
-            if not hit:
-                # 部分版本面板没有「延伸」入口，续期入口就是 Watch ad 按钮本身
-                log("未找到「延伸」入口，尝试直接点击 Watch ad…")
-                hit2 = click_anywhere(page, watch_labels, 30000) or click_anywhere(
-                    page, watch_labels, 15000, exact=False
+            # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
+            for round_no in range(1, max_ext + 1):
+                cur = api_state(cfg, server_id)
+                used_today = today_used(cur)
+                session_ext = int(cur.get("sessionExtensions") or 0)
+                log("-" * 60)
+                log(
+                    f"第 {round_no}/{max_ext} 轮：今日 {used_today}/4 | 本会话累计 {session_ext}/4 "
+                    f"| 到期 {cur.get('sessionExpiresAt')}"
                 )
-                if hit2:
-                    log(f"已直接点击 Watch ad 作为续期入口: {hit2}")
-                    hit = "Watch ad(直入)"
-                    entered_direct = True
-            if not hit:
-                log("未找到续期入口按钮")
-                dump_page_debug(page, "找不到延伸按钮")
-                notify(
-                    cfg,
-                    "❌ Voer 续期失败",
-                    [
-                        f"服务器: <code>{short_id}</code>",
-                        "原因: 未找到「延伸/续期」按钮",
-                        "请查看 Actions 日志或 debug 截图",
-                    ],
-                    photo=pathlib.Path(_shot_name("debug_screenshot.png")),
-                )
-                return False
-            log(f"已点击续期入口: {hit}")
-            page.wait_for_timeout(3000)
+                if used_today >= 4:
+                    stop_reason = f"今日已达上限（{used_today}/4）"
+                    log(f"到达平台限制：{stop_reason}，停止续期")
+                    break
+                if session_ext >= 4:
+                    stop_reason = f"本会话已达上限（{session_ext}/4）"
+                    log(f"到达平台限制：{stop_reason}，停止续期")
+                    break
 
-            if not entered_direct:
-                hit2 = click_anywhere(page, watch_labels, 30000)
-                if not hit2:
-                    hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
-                if not hit2:
-                    log("未找到「观看广告」按钮（可能已直接进入广告流程）")
-                else:
-                    log(f"已点击观看广告: {hit2}")
-            log("已打开广告流程，等待 Ad ready…")
-            page.wait_for_timeout(8000)
-
-            total = int(cfg["ads_per_extension"])
-            for i in range(1, total + 1):
-                hit = click_anywhere(
-                    page, ["Watch ad", "觀看廣告", "观看广告"], 75000
-                )
+                # 点「延伸 / Extend」
+                log("正在寻找「续期/延伸」按钮…")
+                hit = click_anywhere(page, extend_labels, 45000)
                 if not hit:
-                    log(f"第 {i} 个 Watch ad 未找到，停止")
-                    break
-                log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-                page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
-                closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
-                log(
-                    f"第 {i} 个广告:",
-                    f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-                )
-                page.wait_for_timeout(6000)
-
-            end = time.time() + 180
-            while time.time() < end:
-                try:
-                    now = api_state(cfg, server_id)
-                except SystemExit:
-                    now = None
-                except Exception:
-                    now = None
-                if now and (
-                    now.get("sessionExtensions", 0)
-                    > before.get("sessionExtensions", 0)
-                    or now.get("sessionExpiresAt") != before.get("sessionExpiresAt")
-                ):
-                    log(
-                        "续期成功 -> 新到期:",
-                        now.get("sessionExpiresAt"),
-                        "| 累计:",
-                        now.get("sessionExtensions"),
-                        "| 今日:",
-                        today_used(now),
+                    page.wait_for_timeout(5000)
+                    # 弹窗（Cookie/公告）可能中途弹出挡住按钮，再点一次
+                    for accept_txt in ("Accept", "Accept all", "同意", "接受", "OK"):
+                        if click_anywhere(page, [accept_txt], 2000):
+                            log(f"再次点掉弹窗: {accept_txt}")
+                    hit = click_anywhere(page, extend_labels, 30000, exact=False)
+                entered_direct = False
+                if not hit:
+                    # 部分版本面板没有「延伸」入口，续期入口就是 Watch ad 按钮本身
+                    log("未找到「延伸」入口，尝试直接点击 Watch ad…")
+                    hit2 = click_anywhere(page, watch_labels, 30000) or click_anywhere(
+                        page, watch_labels, 15000, exact=False
                     )
-                    success = True
+                    if hit2:
+                        log(f"已直接点击 Watch ad 作为续期入口: {hit2}")
+                        hit = "Watch ad(直入)"
+                        entered_direct = True
+                if not hit:
+                    log("未找到续期入口按钮")
+                    if round_no == 1:
+                        dump_page_debug(page, "找不到延伸按钮")
+                        notify(
+                            cfg,
+                            "❌ Voer 续期失败",
+                            [
+                                f"服务器: <code>{short_id}</code>",
+                                "原因: 未找到「延伸/续期」按钮",
+                                "请查看 Actions 日志或 debug 截图",
+                            ],
+                            photo=pathlib.Path(_shot_name("debug_screenshot.png")),
+                        )
+                        return False
+                    stop_reason = "找不到「延伸/续期」按钮"
                     break
-                time.sleep(10)
-            else:
-                log(
-                    "未检测到续期生效，请检查窗口是否卡在某个广告上，或今日次数已用尽（最多 4 次）"
-                )
-                now = now or {}
+                log(f"已点击续期入口: {hit}")
+                page.wait_for_timeout(3000)
 
-            # 成功/失败都截一张最终画面
-            shot = take_screenshot(page, "renew_screenshot.png")
+                if not entered_direct:
+                    hit2 = click_anywhere(page, watch_labels, 30000)
+                    if not hit2:
+                        hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
+                    if not hit2:
+                        log("未找到「观看广告」按钮（可能已直接进入广告流程）")
+                    else:
+                        log(f"已点击观看广告: {hit2}")
+                log("已打开广告流程，等待 Ad ready…")
+                page.wait_for_timeout(8000)
+
+                total = int(cfg["ads_per_extension"])
+                for i in range(1, total + 1):
+                    hit = click_anywhere(
+                        page, ["Watch ad", "觀看廣告", "观看广告"], 75000
+                    )
+                    if not hit:
+                        log(f"第 {i} 个 Watch ad 未找到，停止")
+                        break
+                    log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
+                    page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
+                    closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
+                    log(
+                        f"第 {i} 个广告:",
+                        f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
+                    )
+                    page.wait_for_timeout(6000)
+
+                # 等待本轮 +4h 生效
+                end = time.time() + 180
+                round_ok = False
+                while time.time() < end:
+                    try:
+                        now = api_state(cfg, server_id)
+                    except SystemExit:
+                        now = None
+                    except Exception:
+                        now = None
+                    if now and (
+                        now.get("sessionExtensions", 0) > cur.get("sessionExtensions", 0)
+                        or now.get("sessionExpiresAt") != cur.get("sessionExpiresAt")
+                    ):
+                        rounds_ok += 1
+                        round_ok = True
+                        success = True
+                        log(
+                            f"第 {round_no} 轮续期成功 -> 新到期: {now.get('sessionExpiresAt')}"
+                            f" | 累计: {now.get('sessionExtensions')} | 今日: {today_used(now)}"
+                        )
+                        break
+                    time.sleep(10)
+                if not round_ok:
+                    log(f"第 {round_no} 轮未检测到续期生效（广告未播完 / 页面卡住 / 已达上限），停止后续轮次")
+                    stop_reason = stop_reason or "本轮未检测到续期生效"
+                    now = now or cur
+                    break
+
+                # 给页面一点时间回到可再次「延伸」的状态
+                page.wait_for_timeout(3000)
+
+            # 结束前截一张最终画面
+            last_shot = take_screenshot(page, "renew_screenshot.png")
 
         except SystemExit:
             raise
@@ -695,18 +728,17 @@ def run_server(cfg, server_id):
 
     # 结束后发通知
     if success:
-        notify(
-            cfg,
-            "✅ Voer 续期成功",
-            [
-                f"服务器: <code>{short_id}</code>",
-                f"原到期: {before.get('sessionExpiresAt')}",
-                f"新到期: <b>{now.get('sessionExpiresAt')}</b>",
-                f"累计续期: {now.get('sessionExtensions')}",
-                f"今日续期: {today_used(now)} / 4 (UTC)",
-            ],
-            photo=shot,
-        )
+        summary = [
+            f"服务器: <code>{short_id}</code>",
+            f"原到期: {before.get('sessionExpiresAt')}",
+            f"新到期: <b>{now.get('sessionExpiresAt')}</b>",
+            f"本次续期: {rounds_ok} 次（+{rounds_ok * 4} 小时）",
+            f"累计续期: {now.get('sessionExtensions')}",
+            f"今日续期: {today_used(now)} / 4 (UTC)",
+        ]
+        if stop_reason:
+            summary.append(f"停止原因: {stop_reason}")
+        notify(cfg, "✅ Voer 续期成功", summary, photo=last_shot)
         return True
     else:
         notify(
@@ -718,10 +750,9 @@ def run_server(cfg, server_id):
                 f"累计: {before.get('sessionExtensions')} | 今日: {today_used(before)} / 4 (UTC)",
                 "可能原因: 广告未播完 / 今日已达 4 次上限 / 页面卡住",
             ],
-            photo=shot if shot.exists() else None,
+            photo=last_shot if last_shot.exists() else None,
         )
         return False
-
 
 def main():
     cfg = load_config()
