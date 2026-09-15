@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     "use_system_chrome": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
-    "tg_title": "Godlike 续期通知",   # TG 通知标题，可用环境变量 TG_TITLE 覆盖
+    "tg_title": "voer续期通知",   # TG 通知标题，可用环境变量 TG_TITLE 覆盖
 }
 
 from playwright.sync_api import sync_playwright
@@ -174,8 +174,8 @@ def tg_send_photo(cfg, photo_path: pathlib.Path, caption: str = "") -> bool:
 
 def notify(cfg, title: str, lines: list, photo: pathlib.Path | None = None):
     """统一通知入口：有 TG 配置就发，没有就只打日志。"""
-    text = f"<b>{title}</b>\n" + "\n".join(lines)
-    log("通知内容:\n" + text.replace("<b>", "").replace("</b>", ""))
+    text = f"{title}\n" + "\n".join(lines)
+    log("通知内容:\n" + text)
     if not _tg_enabled(cfg):
         log("未配置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，跳过 TG 通知")
         return
