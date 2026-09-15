@@ -280,13 +280,20 @@ def fetch_account_email(cfg) -> str:
 def notify_godlike(cfg, account, server_id, result, uptime_sec, status):
     """按固定模板发送续期通知（纯文本）。"""
     lines = [
-        f"⏰运行时间: {fmt_local_time()}",
-        f"🖥️账号: {account or '—'}",
-        f"🖥️服务器: {server_id}",
-        f"🔢下次可续期: {fmt_duration(uptime_sec)}",
-        f"📊续期结果: {result}",
-        f"📊开机状态: {status_text(status)}",
+        f"⏰时间: {fmt_local_time()}",
+        f"🖥账号: {account or '—'}",
+        f"🖥服务器: {server_id}",
+        f"🔋会话剩余: {fmt_duration(uptime_sec)}",
+        f"📈续期结果: {result}",
+        f"🔌状态: {status_text(status)}",
     ]
+    # 异常/停止/维护时追加操作指引，便于收到通知后直接处理
+    s = (status or "").lower()
+    if s in (
+        "stopped", "offline", "crashed", "error",
+        "provisioning_error", "supervisor_error", "maintenance",
+    ):
+        lines.append("⚠️动作: 请到 voer.host 面板手动开机 / 重启，或检查节点")
     notify(cfg, cfg.get("tg_title") or "Godlike 续期通知", lines)
 
 
@@ -354,6 +361,29 @@ def today_used(server: dict) -> int:
         return 0
 
 
+def normalize_server_id(raw: str) -> str:
+    """把 server_id 归一化为纯 UUID。
+
+    支持多种填法：
+      - 纯 UUID:                 f983c91b-bff1-4656-8a47-63dc9da91ffa
+      - 面板 URL:                https://voer.host/panel/server/f983c91b-...
+      - 带尾斜杠/路径:           .../panel/server/f983c91b-.../
+    不合规时原样返回（后续校验会报错），避免静默吞掉错误。
+    """
+    s = (raw or "").strip().strip('"').strip("'").strip()
+    if not s:
+        return s
+    # 从 /panel/server/<UUID> 或任何路径里抽取 UUID 片段
+    m = re.search(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        s,
+    )
+    if m:
+        return m.group(0)
+    # 没有 UUID 形态（例如填了主页、token 等），原样返回，让后续报错明显
+    return s
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
 
@@ -400,7 +430,7 @@ def load_config():
 
     # 多服务器支持：VOER_SERVER_ID / server_id 可填多个 UUID，
     # 用逗号、分号或空白分隔（同一账号的 token 对所有服务器通用）
-    ids = [x for x in re.split(r"[,;\s]+", sid.strip()) if x]
+    ids = [normalize_server_id(x) for x in re.split(r"[,;\s]+", sid.strip()) if x.strip()]
     seen = set()
     server_ids = []
     for x in ids:
@@ -411,7 +441,13 @@ def load_config():
 
     log(f"server_id 数量={len(server_ids)}")
     for x in server_ids:
-        log(f"  - {x[:8]}…")
+        # 若原始填法非纯 UUID，提示已自动归一化（便于发现配置笔误）
+        if x != sid.strip() and not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", x
+        ):
+            log(f"  - {x[:8]}…（已归一化）")
+        else:
+            log(f"  - {x[:8]}…")
     log(f"token 诊断: {_jwt_hint(token)}")
     # 诊断环境变量是否真正传入（不打印完整 secret）
     raw_tg_t = os.environ.get("TELEGRAM_BOT_TOKEN")
